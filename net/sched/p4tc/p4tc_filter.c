@@ -19,6 +19,7 @@
 #include <linux/err.h>
 #include <net/p4tc.h>
 #include <net/netlink.h>
+#include <net/sock.h>
 
 enum {
 	P4TC_FILTER_OPND_ENTRY_KIND_UNSPEC,
@@ -69,6 +70,115 @@ struct p4tc_filter_oper {
 	u16 op_kind;
 	u16 op_value;
 };
+
+struct p4tc_filter_sock {
+	struct rhash_head ht_node;
+	struct rcu_head rcu;
+	struct p4tc_filter *p4tc_filter;
+	struct sock *sk;
+	possible_net_t pnet;
+	int cmd; /* CRUD command */
+	u32 portid;
+	u32 obj_id;
+};
+
+struct p4tc_filter_sock_cmp_arg
+{
+	possible_net_t pnet;
+	u32 portid;
+};
+
+static const struct rhashtable_params p4tc_filter_sock_table_params = {
+	.head_offset = offsetof(struct p4tc_filter_sock, ht_node),
+	.key_len = sizeof(struct sock *),
+	.key_offset = offsetof(struct p4tc_filter_sock, sk),
+	.automatic_shrinking = true,
+};
+
+struct rhashtable p4tc_filter_sock_table;
+static DEFINE_SPINLOCK(p4tc_filter_sock_table_lock);
+
+static void p4tc_filter_sock_destroy(struct p4tc_filter_sock *filter_sock)
+{
+	spin_lock(&p4tc_filter_sock_table_lock);
+	rhashtable_remove_fast(&p4tc_filter_sock_table, &filter_sock->ht_node,
+			       p4tc_filter_sock_table_params);
+	spin_unlock(&p4tc_filter_sock_table_lock);
+	__sock_put(filter_sock->sk);
+	p4tc_filter_destroy(filter_sock->p4tc_filter);
+	kfree_rcu(filter_sock, rcu);
+}
+
+static struct p4tc_filter_sock *
+p4tc_filter_sock_table_lookup_by_sock(struct sock *sk)
+{
+
+	return rhashtable_lookup(&p4tc_filter_sock_table, &sk,
+				 p4tc_filter_sock_table_params);
+}
+
+static int p4tc_filter_sock_insert(struct p4tc_filter_sock *filter_sock)
+{
+	int ret;
+
+	spin_lock(&p4tc_filter_sock_table_lock);
+	ret = rhashtable_insert_fast(&p4tc_filter_sock_table,
+				     &filter_sock->ht_node,
+				     p4tc_filter_sock_table_params);
+	spin_unlock(&p4tc_filter_sock_table_lock);
+	return ret;
+}
+
+static int p4tc_filter_netlink_notify(struct notifier_block *nb,
+				      unsigned long state,
+				      void *_notify)
+{
+	struct p4tc_filter_sock *filter_sock = NULL;
+	struct netlink_notify *notify = _notify;
+	struct rhashtable_iter iter;
+
+	if (state != NETLINK_URELEASE || notify->protocol != NETLINK_ROUTE)
+		return NOTIFY_DONE;
+
+	rhashtable_walk_enter(&p4tc_filter_sock_table, &iter);
+	do {
+		rhashtable_walk_start(&iter);
+
+		while ((filter_sock = rhashtable_walk_next(&iter)) &&
+		       !IS_ERR(filter_sock)) {
+			if (read_pnet(&filter_sock->pnet) == notify->net &&
+			    filter_sock->portid == notify->portid) {
+				rhashtable_walk_stop(&iter);
+				goto walk_exit;
+			}
+		}
+
+		rhashtable_walk_stop(&iter);
+	} while (filter_sock == ERR_PTR(-EAGAIN));
+walk_exit:
+	rhashtable_walk_exit(&iter);
+	if (!filter_sock)
+		return NOTIFY_DONE;
+
+	p4tc_filter_sock_destroy(filter_sock);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block p4tc_filter_notifier = {
+	.notifier_call = p4tc_filter_netlink_notify,
+};
+
+void p4tc_filter_sock_table_init(void)
+{
+	/* Since parameters are hardcoded, rhashtable_init will never fail */
+	rhashtable_init(&p4tc_filter_sock_table,
+			&p4tc_filter_sock_table_params);
+	/* Since no other user is registering this notifier,
+	 * netlink_register_notifier will never fail
+	 */
+	netlink_register_notifier(&p4tc_filter_notifier);
+}
 
 static const struct nla_policy
 p4tc_entry_filter_act_policy[P4TC_FILTER_OPND_ENTRY_ACT_MAX + 1] = {
@@ -254,7 +364,7 @@ static void p4tc_filter_oper_destroy(struct p4tc_filter_oper *operation)
 
 void p4tc_filter_destroy(struct p4tc_filter *filter)
 {
-	if (filter)
+	if (filter && filter->operation)
 		p4tc_filter_oper_destroy(filter->operation);
 	kfree(filter);
 }
@@ -453,7 +563,9 @@ p4tc_filter_opnd_build(struct p4tc_filter_context *ctx, struct nlattr *nla,
 			goto free_filter_opnd;
 		break;
 	default:
-		ret = -EINVAL;
+		NL_SET_ERR_MSG_FMT(extack, "Unsupported runtime object ID %u\n",
+				   ctx->obj_id);
+		ret = -ENOTSUPP;
 		goto free_filter_opnd;
 	}
 
@@ -619,8 +731,8 @@ p4tc_filter_oper_build(struct p4tc_filter_context *ctx, struct nlattr *nla,
 		       u32 depth, struct netlink_ext_ack *extack)
 {
 	struct p4tc_filter_node *filter_node2 = NULL;
-	struct p4tc_filter_node *filter_node1;
 	struct nlattr *tb[P4TC_FILTER_OP_MAX + 1];
+	struct p4tc_filter_node *filter_node1;
 	struct p4tc_filter_oper *filter_oper;
 	u16 filter_op_value;
 	u16 filter_op_kind;
@@ -723,7 +835,7 @@ static struct p4tc_filter *
 __p4tc_filter_build(struct p4tc_filter_context *ctx,
 		    struct nlattr *nla, struct netlink_ext_ack *extack)
 {
-	struct p4tc_filter_oper *filter_oper;
+	struct p4tc_filter_oper *filter_oper = NULL;
 	struct p4tc_filter *filter;
 
 	if (!p4tc_filter_obj_id_supported(ctx->obj_id, extack))
@@ -733,10 +845,12 @@ __p4tc_filter_build(struct p4tc_filter_context *ctx,
 	if (!filter)
 		return ERR_PTR(-ENOMEM);
 
-	filter_oper = p4tc_filter_oper_build(ctx, nla, 0, extack);
-	if (IS_ERR(filter_oper)) {
-		kfree(filter);
-		return (struct p4tc_filter *)filter_oper;
+	if (nla) {
+		filter_oper = p4tc_filter_oper_build(ctx, nla, 0, extack);
+		if (IS_ERR(filter_oper)) {
+			kfree(filter);
+			return (struct p4tc_filter *)filter_oper;
+		}
 	}
 
 	filter->operation = filter_oper;
@@ -772,6 +886,67 @@ p4tc_filter_build(struct p4tc_filter_context *ctx,
 		return ERR_PTR(ret);
 
 	return __p4tc_filter_build(ctx, tb[P4TC_FILTER_OP], extack);
+}
+
+static int p4tc_filter_sock_build(struct sk_buff *skb,
+				  struct p4tc_filter_context *ctx,
+				  struct nlattr *nla,
+				  struct netlink_ext_ack *extack)
+{
+	struct nlattr *tb[P4TC_FILTER_MAX + 1] = {0};
+	struct p4tc_filter_sock *filter_sock;
+	struct sock *sk = NETLINK_CB(skb).sk;
+	struct p4tc_filter *filter = NULL;
+	int ret;
+
+	if (nla) {
+		ret = nla_parse_nested(tb, P4TC_FILTER_MAX, nla,
+				       p4tc_entry_filter_policy, extack);
+		if (ret < 0)
+			return ret;
+	}
+
+	filter = __p4tc_filter_build(ctx, tb[P4TC_FILTER_OP], extack);
+	if (IS_ERR(filter))
+		return PTR_ERR(filter);
+
+	filter_sock = kzalloc(sizeof(*filter_sock), GFP_KERNEL);
+	if (!filter_sock) {
+		ret = -ENOMEM;
+		goto destroy_filter;
+	}
+
+	lock_sock(sk);
+	sock_hold(sk);
+	filter_sock->cmd = ctx->cmd;
+	filter_sock->obj_id = ctx->obj_id;
+	write_pnet(&filter_sock->pnet, sock_net(sk));
+	filter_sock->portid = NETLINK_CB(skb).portid;
+	filter_sock->sk = sk;
+	filter_sock->p4tc_filter = filter;
+	ret = p4tc_filter_sock_insert(filter_sock);
+	release_sock(sk);
+
+	if (ret < 0)
+		goto free_filter_sock;
+
+	return 0;
+
+free_filter_sock:
+	kfree(filter_sock);
+
+destroy_filter:
+	p4tc_filter_destroy(filter);
+	__sock_put(sk);
+	return ret;
+}
+
+int p4tc_filter_subscribe(struct sk_buff *skb,
+			  struct p4tc_filter_context *ctx,
+			  struct nlattr *nla,
+			  struct netlink_ext_ack *extack)
+{
+	return p4tc_filter_sock_build(skb, ctx, nla, extack);
 }
 
 static int
@@ -1008,5 +1183,42 @@ bool p4tc_filter_exec(struct p4tc_filter *filter,
 	if (!filter)
 		return true;
 
-	return p4tc_filter_exec_oper(filter->operation, entry);
+	if (filter->operation)
+		return p4tc_filter_exec_oper(filter->operation, entry);
+
+	return true;
+}
+
+int p4tc_filter_broadcast_cb(struct sock *dsk, struct sk_buff *skb,
+			     void *data)
+{
+	struct p4tc_filter_data *filter_data = data;
+	struct p4tc_filter_sock *filter_sock;
+	int ret;
+
+	filter_sock = p4tc_filter_sock_table_lookup_by_sock(dsk);
+	if (!filter_sock)
+		return 0;
+
+	if (filter_data->obj_id != filter_sock->obj_id)
+		return 1;
+
+	if (filter_sock->cmd && filter_data->cmd != filter_sock->cmd)
+		return 1;
+
+	switch (filter_data->obj_id) {
+	case P4TC_FILTER_OBJ_RUNTIME_TABLE: {
+		struct p4tc_filter *filter = filter_sock->p4tc_filter;
+		struct p4tc_table_entry *entry = filter_data->table.entry;
+
+		if (filter->tbl_id != filter_data->table.id)
+			return 1;
+
+		return !p4tc_filter_exec(filter, entry);
+	}
+	default:
+		ret = 0;
+	}
+
+	return ret;
 }

@@ -84,7 +84,7 @@ int p4tc_ctl_extern_dump(struct sk_buff *skb, struct netlink_callback *cb,
 void p4tc_ext_purge(struct idr *idr);
 void p4tc_ext_inst_purge(struct p4tc_extern_inst *inst);
 
-int p4tc_ctl_extern(struct sk_buff *skb, struct nlmsghdr *n, int cmd,
+int p4tc_ctl_extern(struct sk_buff *skb, struct nlmsghdr *n, struct nlattr **tb,
 		    struct netlink_ext_ack *extack);
 struct p4tc_extern_param *
 p4tc_ext_param_find_byanyattr(struct idr *params_idr,

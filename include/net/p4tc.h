@@ -69,6 +69,17 @@ struct p4tc_dump_ctx {
 	struct p4tc_filter *entry_filter;
 };
 
+struct p4tc_filter_data {
+	union {
+		struct {
+			u32 id;
+			struct p4tc_table_entry *entry;
+		} table;
+	};
+	int cmd;
+	u32 obj_id;
+};
+
 enum {
 	P4TC_FILTER_OBJ_UNSPEC,
 	P4TC_FILTER_OBJ_TMPL_PIPELINE,
@@ -81,6 +92,39 @@ enum {
 };
 
 #define P4TC_FILTER_OBJ_MAX (__P4TC_FILTER_OBJ_MAX - 1)
+
+int
+p4tc_nlmsg_filtered_notify(struct net *net, struct sk_buff *skb,
+			   const u32 portid, gfp_t gfp_flags,
+			   const bool echo, netlink_filter_fn filter,
+			   void *filter_data);
+
+static inline int p4tc_obj_to_filter_obj(const u32 p4tc_obj, bool runtime)
+{
+	if (runtime) {
+		switch (p4tc_obj) {
+		case P4TC_OBJ_RUNTIME_TABLE:
+			return P4TC_FILTER_OBJ_RUNTIME_TABLE;
+		case P4TC_OBJ_RUNTIME_EXTERN:
+			return P4TC_FILTER_OBJ_RUNTIME_EXT;
+		default:
+			return -EINVAL;
+		}
+	} else {
+		switch (p4tc_obj) {
+		case P4TC_OBJ_PIPELINE:
+			return P4TC_FILTER_OBJ_TMPL_PIPELINE;
+		case P4TC_OBJ_ACT:
+			return P4TC_FILTER_OBJ_TMPL_ACT;
+		case P4TC_OBJ_TABLE:
+			return P4TC_FILTER_OBJ_TMPL_TABLE;
+		case P4TC_OBJ_EXT:
+			return P4TC_FILTER_OBJ_TMPL_EXT;
+		default:
+			return -EINVAL;
+		}
+	}
+}
 
 struct p4tc_template_common;
 
@@ -731,8 +775,12 @@ p4tc_tmpl_table_entry_cu(struct net *net, struct nlattr *arg,
 			 struct p4tc_table *table,
 			 struct netlink_ext_ack *extack);
 int p4tc_tbl_entry_root(struct net *net, struct sk_buff *skb,
-			struct nlmsghdr *n, int cmd,
+			struct nlmsghdr *n, struct nlattr **tb,
 			struct netlink_ext_ack *extack);
+int p4tc_tbl_entry_filter_sub(struct sk_buff *skb,
+			      struct p4tc_path_nlattrs *nl_path_attrs,
+			      struct nlattr *nla, u32 cmd,
+			      struct netlink_ext_ack *extack);
 int p4tc_tbl_entry_dumpit(struct net *net, struct sk_buff *skb,
 			  struct netlink_callback *cb,
 			  struct nlattr *arg, char *p_name);
@@ -748,7 +796,14 @@ p4tc_filter_build(struct p4tc_filter_context *ctx,
 		  struct nlattr *nla, struct netlink_ext_ack *extack);
 bool p4tc_filter_exec(struct p4tc_filter *filter,
 		      struct p4tc_table_entry *entry);
+int p4tc_filter_broadcast_cb(struct sock *dsk, struct sk_buff *skb,
+			     void *data);
 void p4tc_filter_destroy(struct p4tc_filter *filter);
+void p4tc_filter_sock_table_init(void);
+int p4tc_filter_subscribe(struct sk_buff *skb,
+			  struct p4tc_filter_context *ctx,
+			  struct nlattr *nla,
+			  struct netlink_ext_ack *extack);
 
 struct tcf_p4act *
 p4a_runt_prealloc_get_next(struct p4tc_act *act);

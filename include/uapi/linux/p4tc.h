@@ -102,11 +102,22 @@ enum {
 
 /* Root attributes */
 enum {
+	P4TC_SUBSCRIBE_UNSPEC,
+	P4TC_SUBSCRIBE_OBJNAME, /* object name */
+	P4TC_SUBSCRIBE_OBJID, /* object 32-bit ID */
+	__P4TC_SUBSCRIBE_MAX,
+};
+
+#define P4TC_SUBSCRIBE_MAX (__P4TC_SUBSCRIBE_MAX - 1)
+
+/* Root attributes */
+enum {
 	P4TC_ROOT_UNSPEC,
 	P4TC_ROOT, /* nested messages */
 	P4TC_ROOT_PNAME, /* string - mandatory for pipeline create */
 	P4TC_ROOT_COUNT,
 	P4TC_ROOT_FLAGS,
+	P4TC_ROOT_SUBSCRIBE, /* nested subscribe message, will contain filter */
 	__P4TC_ROOT_MAX,
 };
 
@@ -141,6 +152,7 @@ enum {
 	P4TC_PATH,
 	P4TC_PARAMS,
 	P4TC_COUNT,
+	P4TC_CMD,
 	__P4TC_MAX,
 };
 

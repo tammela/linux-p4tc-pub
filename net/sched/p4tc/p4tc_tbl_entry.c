@@ -756,6 +756,40 @@ unlock:
 	return found;
 }
 
+int
+p4tc_nlmsg_filtered_notify(struct net *net, struct sk_buff *skb,
+			   const u32 portid, gfp_t gfp_flags,
+			   const bool echo, netlink_filter_fn filter,
+			   void *filter_data)
+{
+	int exclude_portid = 0;
+	int err;
+
+	if (echo) {
+		refcount_inc(&skb->users);
+		exclude_portid = portid;
+	}
+
+	err = nlmsg_multicast_filtered(net->rtnl, skb, exclude_portid,
+				       RTNLGRP_TC, gfp_flags,
+				       filter, filter_data);
+	if (err == -ESRCH)
+		err = 0;
+
+	if (echo) {
+		int err2;
+
+		err2 = nlmsg_unicast(net->rtnl, skb, portid);
+		if (!err)
+			err = err2;
+	}
+
+	if (!err)
+		return 0;
+
+	return err;
+}
+
 static struct sk_buff *
 alloc_and_fill_root_attrs(struct nlmsghdr **nlh, struct p4tc_pipeline *pipeline,
 			  const u32 portid, const u32 seq, const int cmd,
@@ -802,6 +836,7 @@ p4tc_tbl_entry_emit_event(struct p4tc_table_entry_work *entry_work,
 	u16 who_deleted_ent = entry_work->who_deleted_ent;
 	struct p4tc_table *table = entry_work->table;
 	char *who_deleted = entry_work->who_deleted;
+	struct p4tc_filter_data filter_data = {};
 	struct net *net = pipeline->net;
 	struct nlmsghdr *nlh;
 	struct nlattr *nest;
@@ -830,8 +865,18 @@ p4tc_tbl_entry_emit_event(struct p4tc_table_entry_work *entry_work,
 	if (cmd == RTM_P4TC_GET)
 		return rtnl_unicast(skb, net, portid);
 
-	err = nlmsg_notify(net->rtnl, skb, portid, RTNLGRP_TC, echo,
-			   GFP_ATOMIC);
+	filter_data.table.entry = entry;
+	filter_data.table.id = table->tbl_id;
+	filter_data.obj_id = P4TC_FILTER_OBJ_RUNTIME_TABLE;
+	filter_data.cmd = cmd;
+
+	if (lock_rtnl)
+		rcu_read_lock();
+	err = p4tc_nlmsg_filtered_notify(net, skb, portid, GFP_ATOMIC,
+					 echo, p4tc_filter_broadcast_cb,
+					 &filter_data);
+	if (lock_rtnl)
+		rcu_read_unlock();
 	if (!err)
 		return 0;
 
@@ -3009,25 +3054,15 @@ out:
 }
 
 int p4tc_tbl_entry_root(struct net *net, struct sk_buff *skb,
-			struct nlmsghdr *n, int cmd,
+			struct nlmsghdr *n, struct nlattr **tb,
 			struct netlink_ext_ack *extack)
 {
 	struct nlattr *p4tca[P4TC_MSGBATCH_SIZE + 1];
 	int echo = n->nlmsg_flags & NLM_F_ECHO;
-	struct nlattr *tb[P4TC_ROOT_MAX + 1];
+	int cmd = n->nlmsg_type;
 	char *p_name = NULL;
 	int listeners;
 	int ret = 0;
-
-	ret = nlmsg_parse(n, sizeof(struct p4tcmsg), tb, P4TC_ROOT_MAX,
-			  p4tc_root_policy, extack);
-	if (ret < 0)
-		return ret;
-
-	if (NL_REQ_ATTR_CHECK(extack, NULL, tb, P4TC_ROOT)) {
-		NL_SET_ERR_MSG(extack, "Netlink P4TC table attributes missing");
-		return -EINVAL;
-	}
 
 	ret = nla_parse_nested(p4tca, P4TC_MSGBATCH_SIZE, tb[P4TC_ROOT], NULL,
 			       extack);
@@ -3050,6 +3085,47 @@ int p4tc_tbl_entry_root(struct net *net, struct sk_buff *skb,
 	else
 		ret = __p4tc_tbl_entry_root_fast(net, n, cmd, p_name, p4tca,
 						 extack);
+	return ret;
+}
+
+int p4tc_tbl_entry_filter_sub(struct sk_buff *skb,
+			      struct p4tc_path_nlattrs *nl_path_attrs,
+			      struct nlattr *nla, u32 cmd,
+			      struct netlink_ext_ack *extack)
+{
+	struct p4tc_table_get_state table_get_state = { NULL };
+	struct nlattr *tb[P4TC_ENTRY_MAX + 1] = { NULL };
+	struct p4tc_filter_context ctx = {0};
+	struct net *net = sock_net(skb->sk);
+	struct p4tc_pipeline *pipeline;
+	struct p4tc_table *table;
+	int ret;
+
+	if (nla) {
+		ret = nla_parse_nested(tb, P4TC_ENTRY_MAX, nla,
+				       p4tc_entry_policy, extack);
+		if (ret < 0)
+			return ret;
+
+		ret = p4tc_table_entry_get_table(net, RTM_P4TC_GET,
+						 &table_get_state, tb,
+						 nl_path_attrs, extack);
+		if (ret < 0)
+			return ret;
+	}
+
+	pipeline = table_get_state.pipeline;
+	table = table_get_state.table;
+
+	ctx.obj_id = P4TC_FILTER_OBJ_RUNTIME_TABLE;
+	ctx.pipeline = pipeline;
+	ctx.table = table;
+	ctx.cmd = cmd;
+
+	ret = p4tc_filter_subscribe(skb, &ctx, tb[P4TC_ENTRY_FILTER],
+				    extack);
+
+	p4tc_table_entry_put_table(&table_get_state);
 	return ret;
 }
 
